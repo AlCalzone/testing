@@ -1,5 +1,13 @@
 /* eslint-disable @typescript-eslint/camelcase */
 /* eslint-disable @typescript-eslint/no-var-requires */
+import {
+	Client as ObjectsClient,
+	Server as ObjectsServer,
+} from "@iobroker/db-objects-file";
+import {
+	Client as StatesClient,
+	Server as StatesServer,
+} from "@iobroker/db-states-file";
 import { wait } from "alcalzone-shared/async";
 import { extend } from "alcalzone-shared/objects";
 import { ChildProcess, spawn } from "child_process";
@@ -69,16 +77,10 @@ export class TestHarness extends EventEmitter {
 	private testAdapterDir: string;
 	private dbConnection: DBConnection;
 
-	private _objects: any;
-	/** The actual objects DB */
-	public get objects(): any {
-		return this._objects;
-	}
-	private _states: any;
-	/** The actual states DB */
-	public get states(): any {
-		return this._states;
-	}
+	private _objectsServer: any;
+	private _objectsClient: any;
+	private _statesServer: any;
+	private _statesClient: any;
 
 	private _adapterProcess: ChildProcess | undefined;
 	/** The process the adapter is running in */
@@ -96,67 +98,94 @@ export class TestHarness extends EventEmitter {
 	private async createObjectsDB(): Promise<void> {
 		debug("creating objects DB");
 
-		const Objects = require(path.join(
-			this.testControllerDir,
-			"lib/objects/objectsInMemServer",
-		));
+		const settings = {
+			connection: {
+				type: "file",
+				host: "127.0.0.1",
+				port: 19001,
+				user: "",
+				pass: "",
+				noFileCache: false,
+				connectTimeout: 2000,
+			},
+			logger,
+		};
 
-		return new Promise<void>((resolve) => {
-			this._objects = new Objects({
-				connection: {
-					type: "file",
-					host: "127.0.0.1",
-					port: 19001,
-					user: "",
-					pass: "",
-					noFileCache: false,
-					connectTimeout: 2000,
-				},
-				logger,
+		// First create the server
+		await new Promise<void>((resolve) => {
+			this._objectsServer = new ObjectsServer({
+				...settings,
 				connected: () => {
-					debug("  => done!");
-					this._objects.subscribe("*");
+					resolve();
+				},
+			});
+		});
+
+		// Then the client
+		await new Promise<void>((resolve) => {
+			this._objectsClient = new ObjectsClient({
+				...settings,
+				connected: () => {
+					this._objectsClient.subscribe("*");
 					resolve();
 				},
 				change: this.emit.bind(this, "objectChange"),
 			});
 		});
+
+		debug("  => done!");
 	}
 
 	/** Creates the states DB and sets up listeners for it */
 	private async createStatesDB(): Promise<void> {
 		debug("creating states DB");
 
-		const States = require(path.join(
-			this.testControllerDir,
-			"lib/states/statesInMemServer",
-		));
-
-		return new Promise<void>((resolve) => {
-			this._states = new States({
-				connection: {
-					type: "file",
-					host: "127.0.0.1",
-					port: 19000,
-					options: {
-						auth_pass: null,
-						retry_max_delay: 15000,
-					},
+		const settings = {
+			connection: {
+				type: "file",
+				host: "127.0.0.1",
+				port: 19000,
+				options: {
+					auth_pass: null,
+					retry_max_delay: 15000,
 				},
-				logger,
+			},
+			logger,
+		};
+
+		// First create the server
+		await new Promise<void>((resolve) => {
+			this._statesServer = new StatesServer({
+				...settings,
 				connected: () => {
-					debug("  => done!");
-					this._states.subscribe("*");
+					resolve();
+				},
+			});
+		});
+
+		// Then the client
+		await new Promise<void>((resolve) => {
+			this._statesClient = new StatesClient({
+				...settings,
+				connected: () => {
+					this._statesClient.subscribe("*");
 					resolve();
 				},
 				change: this.emit.bind(this, "stateChange"),
 			});
 		});
+
+		debug("  => done!");
 	}
 
 	/** Checks if the controller instance is running */
 	public isControllerRunning(): boolean {
-		return !!this._objects || !!this._states;
+		return (
+			!!this._objectsServer ||
+			!!this._objectsClient ||
+			!!this._statesServer ||
+			!!this._statesClient
+		);
 	}
 
 	/** Starts the controller instance by creating the databases */
@@ -179,7 +208,7 @@ export class TestHarness extends EventEmitter {
 			let stopTimeout: number;
 			try {
 				stopTimeout = (
-					await this._objects.getObjectAsync(
+					await this._objectsClient.getObjectAsync(
 						`system.adapter.${this.adapterName}.0`,
 					)
 				).common.stopTimeout;
@@ -200,14 +229,17 @@ export class TestHarness extends EventEmitter {
 		}
 
 		debug("Stopping controller instance...");
-		if (this._objects) {
-			await this._objects.destroy();
-			this._objects = null;
-		}
-		if (this._states) {
-			await this._states.destroy();
-			this._states = null;
-		}
+		// Stop clients before servers
+		await this._objectsClient?.destroy();
+		await this._objectsServer?.destroy();
+		await this._statesClient?.destroy();
+		await this._statesServer?.destroy();
+
+		this._objectsClient = null;
+		this._objectsServer = null;
+		this._statesClient = null;
+		this._statesServer = null;
+
 		debug("Controller instance stopped");
 	}
 
@@ -315,8 +347,8 @@ export class TestHarness extends EventEmitter {
 				.on("exit", onClose);
 
 			// Tell adapter to stop
-			if (this._objects) {
-				await this._states.setStateAsync(
+			if (this._statesClient) {
+				await this._statesClient.setStateAsync(
 					`system.adapter.${this.adapterName}.0.sigKill`,
 					{
 						val: -1,
@@ -350,14 +382,14 @@ export class TestHarness extends EventEmitter {
 	/** Enables the sendTo method */
 	public enableSendTo(): Promise<void> {
 		return new Promise<void>((resolve) => {
-			this._objects.extendObject(
+			this._objectsClient.setObject(
 				fromAdapterID,
 				{
 					common: {},
 					type: "instance",
 				},
 				() => {
-					this._states.subscribeMessage(fromAdapterID);
+					this._statesClient.subscribeMessage(fromAdapterID);
 					resolve();
 				},
 			);
@@ -384,7 +416,7 @@ export class TestHarness extends EventEmitter {
 		};
 		this.addListener("stateChange", stateChangedHandler);
 
-		this._states.pushMessage(
+		this._statesClient.pushMessage(
 			`system.adapter.${target}`,
 			{
 				command: command,
